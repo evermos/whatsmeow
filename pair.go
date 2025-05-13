@@ -26,29 +26,28 @@ import (
 )
 
 var (
-	AdvAccountSignaturePrefix = []byte{6, 0}
-	AdvDeviceSignaturePrefix  = []byte{6, 1}
-
-	AdvHostedAccountSignaturePrefix = []byte{6, 5}
-	AdvHostedDeviceSignaturePrefix  = []byte{6, 6}
+	AdvPrefixAccountSignature                                = []byte{6, 0}
+	AdvPrefixDeviceSignatureGenerate                         = []byte{6, 1}
+	AdvHostedPrefixDeviceIdentityAccountSignature            = []byte{6, 5}
+	AdvHostedPrefixDeviceIdentityDeviceSignatureVerification = []byte{6, 6}
 )
 
-func (cli *Client) handleIQ(ctx context.Context, node *waBinary.Node) {
+func (cli *Client) handleIQ(node *waBinary.Node) {
 	children := node.GetChildren()
 	if len(children) != 1 || node.Attrs["from"] != types.ServerJID {
 		return
 	}
 	switch children[0].Tag {
 	case "pair-device":
-		cli.handlePairDevice(ctx, node)
+		cli.handlePairDevice(node)
 	case "pair-success":
-		cli.handlePairSuccess(ctx, node)
+		cli.handlePairSuccess(node)
 	}
 }
 
-func (cli *Client) handlePairDevice(ctx context.Context, node *waBinary.Node) {
+func (cli *Client) handlePairDevice(node *waBinary.Node) {
 	pairDevice := node.GetChildByTag("pair-device")
-	err := cli.sendNode(ctx, waBinary.Node{
+	err := cli.sendNode(waBinary.Node{
 		Tag: "iq",
 		Attrs: waBinary.Attrs{
 			"to":   node.Attrs["from"],
@@ -84,7 +83,7 @@ func (cli *Client) makeQRData(ref string) string {
 	return strings.Join([]string{ref, noise, identity, adv}, ",")
 }
 
-func (cli *Client) handlePairSuccess(ctx context.Context, node *waBinary.Node) {
+func (cli *Client) handlePairSuccess(node *waBinary.Node) {
 	id := node.Attrs["id"].(string)
 	pairSuccess := node.GetChildByTag("pair-success")
 
@@ -95,7 +94,7 @@ func (cli *Client) handlePairSuccess(ctx context.Context, node *waBinary.Node) {
 	platform, _ := pairSuccess.GetChildByTag("platform").Attrs["name"].(string)
 
 	go func() {
-		err := cli.handlePair(ctx, deviceIdentityBytes, id, businessName, platform, jid, lid)
+		err := cli.handlePair(deviceIdentityBytes, id, businessName, platform, jid, lid)
 		if err != nil {
 			cli.Log.Errorf("Failed to pair device: %v", err)
 			cli.Disconnect()
@@ -107,50 +106,50 @@ func (cli *Client) handlePairSuccess(ctx context.Context, node *waBinary.Node) {
 	}()
 }
 
-func (cli *Client) handlePair(ctx context.Context, deviceIdentityBytes []byte, reqID, businessName, platform string, jid, lid types.JID) error {
+func (cli *Client) handlePair(deviceIdentityBytes []byte, reqID, businessName, platform string, jid, lid types.JID) error {
 	var deviceIdentityContainer waAdv.ADVSignedDeviceIdentityHMAC
 	err := proto.Unmarshal(deviceIdentityBytes, &deviceIdentityContainer)
 	if err != nil {
-		cli.sendPairError(ctx, reqID, 500, "internal-error")
+		cli.sendPairError(reqID, 500, "internal-error")
 		return &PairProtoError{"failed to parse device identity container in pair success message", err}
 	}
+	isHostedAccount := deviceIdentityContainer.AccountType != nil && *deviceIdentityContainer.AccountType == waAdv.ADVEncryptionType_HOSTED
 
 	h := hmac.New(sha256.New, cli.Store.AdvSecretKey)
-	if deviceIdentityContainer.GetAccountType() == waAdv.ADVEncryptionType_HOSTED {
-		h.Write(AdvHostedAccountSignaturePrefix)
-		//cli.Store.IsHosted = true
+	if isHostedAccount {
+		h.Write(AdvHostedPrefixDeviceIdentityAccountSignature)
 	}
 	h.Write(deviceIdentityContainer.Details)
 
 	if !bytes.Equal(h.Sum(nil), deviceIdentityContainer.HMAC) {
 		cli.Log.Warnf("Invalid HMAC from pair success message")
-		cli.sendPairError(ctx, reqID, 401, "hmac-mismatch")
+		cli.sendPairError(reqID, 401, "not-authorized")
 		return ErrPairInvalidDeviceIdentityHMAC
 	}
 
 	var deviceIdentity waAdv.ADVSignedDeviceIdentity
 	err = proto.Unmarshal(deviceIdentityContainer.Details, &deviceIdentity)
 	if err != nil {
-		cli.sendPairError(ctx, reqID, 500, "internal-error")
+		cli.sendPairError(reqID, 500, "internal-error")
 		return &PairProtoError{"failed to parse signed device identity in pair success message", err}
 	}
+
+	if !verifyDeviceIdentityAccountSignature(&deviceIdentity, cli.Store.IdentityKey, isHostedAccount) {
+		cli.sendPairError(reqID, 401, "not-authorized")
+		return ErrPairInvalidDeviceSignature
+	}
+
+	deviceIdentity.DeviceSignature = generateDeviceSignature(&deviceIdentity, cli.Store.IdentityKey, isHostedAccount)[:]
 
 	var deviceIdentityDetails waAdv.ADVDeviceIdentity
 	err = proto.Unmarshal(deviceIdentity.Details, &deviceIdentityDetails)
 	if err != nil {
-		cli.sendPairError(ctx, reqID, 500, "internal-error")
+		cli.sendPairError(reqID, 500, "internal-error")
 		return &PairProtoError{"failed to parse device identity details in pair success message", err}
 	}
 
-	if !verifyAccountSignature(&deviceIdentity, cli.Store.IdentityKey, deviceIdentityDetails.GetDeviceType() == waAdv.ADVEncryptionType_HOSTED) {
-		cli.sendPairError(ctx, reqID, 401, "signature-mismatch")
-		return ErrPairInvalidDeviceSignature
-	}
-
-	deviceIdentity.DeviceSignature = generateDeviceSignature(&deviceIdentity, cli.Store.IdentityKey)[:]
-
 	if cli.PrePairCallback != nil && !cli.PrePairCallback(jid, platform, businessName) {
-		cli.sendPairError(ctx, reqID, 500, "internal-error")
+		cli.sendPairError(reqID, 500, "internal-error")
 		return ErrPairRejectedLocally
 	}
 
@@ -163,7 +162,7 @@ func (cli *Client) handlePair(ctx context.Context, deviceIdentityBytes []byte, r
 
 	selfSignedDeviceIdentity, err := proto.Marshal(&deviceIdentity)
 	if err != nil {
-		cli.sendPairError(ctx, reqID, 500, "internal-error")
+		cli.sendPairError(reqID, 500, "internal-error")
 		return &PairProtoError{"failed to marshal self-signed device identity", err}
 	}
 
@@ -171,23 +170,23 @@ func (cli *Client) handlePair(ctx context.Context, deviceIdentityBytes []byte, r
 	cli.Store.LID = lid
 	cli.Store.BusinessName = businessName
 	cli.Store.Platform = platform
-	err = cli.Store.Save(ctx)
+	err = cli.Store.Save()
 	if err != nil {
-		cli.sendPairError(ctx, reqID, 500, "internal-error")
+		cli.sendPairError(reqID, 500, "internal-error")
 		return &PairDatabaseError{"failed to save device store", err}
 	}
-	cli.StoreLIDPNMapping(ctx, lid, jid)
-	err = cli.Store.Identities.PutIdentity(ctx, mainDeviceLID.SignalAddress().String(), mainDeviceIdentity)
+	cli.StoreLIDPNMapping(context.TODO(), lid, jid)
+	err = cli.Store.Identities.PutIdentity(mainDeviceLID.SignalAddress().String(), mainDeviceIdentity)
 	if err != nil {
-		_ = cli.Store.Delete(ctx)
-		cli.sendPairError(ctx, reqID, 500, "internal-error")
+		_ = cli.Store.Delete()
+		cli.sendPairError(reqID, 500, "internal-error")
 		return &PairDatabaseError{"failed to store main device identity", err}
 	}
 
 	// Expect a disconnect after this and don't dispatch the usual Disconnected event
 	cli.expectDisconnect()
 
-	err = cli.sendNode(ctx, waBinary.Node{
+	err = cli.sendNode(waBinary.Node{
 		Tag: "iq",
 		Attrs: waBinary.Attrs{
 			"to":   types.ServerJID,
@@ -206,7 +205,7 @@ func (cli *Client) handlePair(ctx context.Context, deviceIdentityBytes []byte, r
 		}},
 	})
 	if err != nil {
-		_ = cli.Store.Delete(ctx)
+		_ = cli.Store.Delete()
 		return fmt.Errorf("failed to send pairing confirmation: %w", err)
 	}
 	return nil
@@ -225,7 +224,7 @@ func concatBytes(data ...[]byte) []byte {
 	return output
 }
 
-func verifyAccountSignature(deviceIdentity *waAdv.ADVSignedDeviceIdentity, ikp *keys.KeyPair, isHosted bool) bool {
+func verifyDeviceIdentityAccountSignature(deviceIdentity *waAdv.ADVSignedDeviceIdentity, ikp *keys.KeyPair, isHostedAccount bool) bool {
 	if len(deviceIdentity.AccountSignatureKey) != 32 || len(deviceIdentity.AccountSignature) != 64 {
 		return false
 	}
@@ -233,24 +232,26 @@ func verifyAccountSignature(deviceIdentity *waAdv.ADVSignedDeviceIdentity, ikp *
 	signatureKey := ecc.NewDjbECPublicKey(*(*[32]byte)(deviceIdentity.AccountSignatureKey))
 	signature := *(*[64]byte)(deviceIdentity.AccountSignature)
 
-	prefix := AdvAccountSignaturePrefix
-	if isHosted {
-		prefix = AdvHostedAccountSignaturePrefix
+	prefix := AdvPrefixAccountSignature
+	if isHostedAccount {
+		prefix = AdvHostedPrefixDeviceIdentityAccountSignature
 	}
 	message := concatBytes(prefix, deviceIdentity.Details, ikp.Pub[:])
-
 	return ecc.VerifySignature(signatureKey, message, signature)
 }
 
-func generateDeviceSignature(deviceIdentity *waAdv.ADVSignedDeviceIdentity, ikp *keys.KeyPair) *[64]byte {
-	prefix := AdvDeviceSignaturePrefix
+func generateDeviceSignature(deviceIdentity *waAdv.ADVSignedDeviceIdentity, ikp *keys.KeyPair, isHostedAccount bool) *[64]byte {
+	prefix := AdvPrefixDeviceSignatureGenerate
+	if isHostedAccount {
+		prefix = AdvHostedPrefixDeviceIdentityDeviceSignatureVerification
+	}
 	message := concatBytes(prefix, deviceIdentity.Details, ikp.Pub[:], deviceIdentity.AccountSignatureKey)
 	sig := ecc.CalculateSignature(ecc.NewDjbECPrivateKey(*ikp.Priv), message)
 	return &sig
 }
 
-func (cli *Client) sendPairError(ctx context.Context, id string, code int, text string) {
-	err := cli.sendNode(ctx, waBinary.Node{
+func (cli *Client) sendPairError(id string, code int, text string) {
+	err := cli.sendNode(waBinary.Node{
 		Tag: "iq",
 		Attrs: waBinary.Attrs{
 			"to":   types.ServerJID,

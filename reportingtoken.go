@@ -12,6 +12,7 @@ import (
 	_ "embed"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"sync"
 
@@ -37,7 +38,7 @@ type reportingField struct {
 }
 
 func (cli *Client) shouldIncludeReportingToken(message *waE2E.Message) bool {
-	if !cli.SendReportingTokens {
+	if !cli.SendReportingTokens || message.GetMessageContextInfo().GetMessageSecret() == nil {
 		return false
 	}
 	return message.ReactionMessage == nil &&
@@ -69,7 +70,11 @@ func (cli *Client) getMessageReportingToken(
 }
 
 func getReportingToken(messageProtobuf []byte) []byte {
-	return extractReportingTokenContent(messageProtobuf, getReportingFields())
+	tok := extractReportingTokenContent(messageProtobuf, getReportingFields())
+	fmt.Println("TOKEN:")
+	fmt.Println(string(tok))
+	fmt.Printf("%x\n", tok)
+	return tok
 }
 
 // Helper to find config for a field number

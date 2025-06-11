@@ -27,14 +27,14 @@ var (
 	KeepAliveMaxFailTime = 3 * time.Minute
 )
 
-func (cli *Client) keepAliveLoop(ctx, connCtx context.Context) {
+func (cli *Client) keepAliveLoop(ctx context.Context) {
 	lastSuccess := time.Now()
 	var errorCount int
 	for {
 		interval := rand.Int64N(KeepAliveIntervalMax.Milliseconds()-KeepAliveIntervalMin.Milliseconds()) + KeepAliveIntervalMin.Milliseconds()
 		select {
 		case <-time.After(time.Duration(interval) * time.Millisecond):
-			isSuccess, shouldContinue := cli.sendKeepAlive(connCtx)
+			isSuccess, shouldContinue := cli.sendKeepAlive(ctx)
 			if !shouldContinue {
 				return
 			} else if !isSuccess {
@@ -47,7 +47,7 @@ func (cli *Client) keepAliveLoop(ctx, connCtx context.Context) {
 					cli.Log.Debugf("Forcing reconnect due to keepalive failure")
 					cli.Disconnect()
 					cli.resetExpectedDisconnect()
-					go cli.autoReconnect(ctx)
+					go cli.autoReconnect()
 				}
 			} else {
 				if errorCount > 0 {
@@ -56,21 +56,19 @@ func (cli *Client) keepAliveLoop(ctx, connCtx context.Context) {
 				}
 				lastSuccess = time.Now()
 			}
-		case <-connCtx.Done():
+		case <-ctx.Done():
 			return
 		}
 	}
 }
 
 func (cli *Client) sendKeepAlive(ctx context.Context) (isSuccess, shouldContinue bool) {
-	respCh, err := cli.sendIQAsync(ctx, infoQuery{
+	respCh, err := cli.sendIQAsync(infoQuery{
 		Namespace: "w:p",
 		Type:      "get",
 		To:        types.ServerJID,
 	})
-	if ctx.Err() != nil {
-		return false, false
-	} else if err != nil {
+	if err != nil {
 		cli.Log.Warnf("Failed to send keepalive: %v", err)
 		return false, true
 	}

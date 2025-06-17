@@ -17,6 +17,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -1093,9 +1095,17 @@ func (cli *Client) prepareMessageNode(
 	}
 
 	start = time.Now()
-	participantNodes, includeIdentity := cli.encryptMessageForDevices(
-		ctx, allDevices, id, plaintext, dsmPlaintext, encAttrs,
-	)
+	var participantNodes []waBinary.Node
+	var includeIdentity bool
+	if cli.EncryptMessageForDevicesConcurrentSize > 0 {
+		participantNodes, includeIdentity = cli.encryptMessageForDevicesConcurrent(
+			ctx, allDevices, id, plaintext, dsmPlaintext, encAttrs,
+		)
+	} else {
+		participantNodes, includeIdentity = cli.encryptMessageForDevices(
+			ctx, allDevices, id, plaintext, dsmPlaintext, encAttrs,
+		)
+	}
 	timings.PeerEncrypt = time.Since(start)
 	participantNode := waBinary.Node{
 		Tag:     "participants",
@@ -1146,6 +1156,161 @@ func (cli *Client) makeDeviceIdentityNode() waBinary.Node {
 		Tag:     "device-identity",
 		Content: deviceIdentity,
 	}
+}
+
+func (cli *Client) encryptMessageForDevicesConcurrent(
+	ctx context.Context,
+	allDevices []types.JID,
+	id string,
+	msgPlaintext, dsmPlaintext []byte,
+	encAttrs waBinary.Attrs,
+) ([]waBinary.Node, bool) {
+	ownJID := cli.getOwnID()
+	ownLID := cli.getOwnLID()
+	includeIdentity := atomic.Bool{}
+	participantNodes := make([]waBinary.Node, 0, len(allDevices))
+	var retryDevices, retryEncryptionIdentities []types.JID
+	limitChan := make(chan struct{}, cli.EncryptMessageForDevicesConcurrentSize)
+	encryptedChan := make(chan *waBinary.Node)
+	retryDeviceChan := make(chan types.JID)
+	retryEncryptionIdentityChan := make(chan types.JID)
+	wg := sync.WaitGroup{}
+	receiverWg := sync.WaitGroup{}
+
+	receiverWg.Add(1)
+	go func() {
+		defer receiverWg.Done()
+		for encrypted := range encryptedChan {
+			participantNodes = append(participantNodes, *encrypted)
+		}
+	}()
+
+	receiverWg.Add(1)
+	go func() {
+		defer receiverWg.Done()
+		for retryDevice := range retryDeviceChan {
+			retryDevices = append(retryDevices, retryDevice)
+		}
+	}()
+
+	receiverWg.Add(1)
+	go func() {
+		defer receiverWg.Done()
+		for retryEncryptionIdentity := range retryEncryptionIdentityChan {
+			retryEncryptionIdentities = append(retryEncryptionIdentities, retryEncryptionIdentity)
+		}
+	}()
+
+	for _, jid := range allDevices {
+		plaintext := msgPlaintext
+		if (jid.User == ownJID.User || jid.User == ownLID.User) && dsmPlaintext != nil {
+			if jid == ownJID {
+				continue
+			}
+			plaintext = dsmPlaintext
+		}
+		encryptionIdentity := jid
+		if jid.Server == types.DefaultUserServer {
+			lidForPN, err := cli.Store.LIDs.GetLIDForPN(ctx, jid)
+			if err != nil {
+				cli.Log.Warnf("Failed to get LID for %s: %v", jid, err)
+			} else if !lidForPN.IsEmpty() {
+				cli.migrateSessionStore(jid, lidForPN)
+				encryptionIdentity = lidForPN
+			}
+		}
+
+		wg.Add(1)
+		limitChan <- struct{}{}
+		go func() {
+			defer func() {
+				<-limitChan
+				wg.Done()
+			}()
+			encrypted, isPreKey, err := cli.encryptMessageForDeviceAndWrap(
+				plaintext, jid, encryptionIdentity, nil, encAttrs,
+			)
+			if errors.Is(err, ErrNoSession) {
+				retryDeviceChan <- jid
+				retryEncryptionIdentityChan <- encryptionIdentity
+				return
+			} else if err != nil {
+				cli.Log.Warnf("Failed to encrypt %s for %s: %v", id, jid, err)
+				return
+			}
+
+			encryptedChan <- encrypted
+
+			if isPreKey {
+				includeIdentity.Store(true)
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(limitChan)
+	close(encryptedChan)
+	close(retryDeviceChan)
+	close(retryEncryptionIdentityChan)
+	receiverWg.Wait()
+
+	if len(retryDevices) > 0 {
+		limitChan := make(chan struct{}, cli.EncryptMessageForDevicesConcurrentSize)
+		encryptedChan := make(chan *waBinary.Node)
+		wg := sync.WaitGroup{}
+
+		receiverWg.Add(1)
+		go func() {
+			defer receiverWg.Done()
+			for encrypted := range encryptedChan {
+				participantNodes = append(participantNodes, *encrypted)
+			}
+		}()
+
+		bundles, err := cli.fetchPreKeys(ctx, retryDevices)
+		if err != nil {
+			cli.Log.Warnf("Failed to fetch prekeys for %v to retry encryption: %v", retryDevices, err)
+		} else {
+			for i, jid := range retryDevices {
+				resp := bundles[jid]
+				if resp.err != nil {
+					cli.Log.Warnf("Failed to fetch prekey for %s: %v", jid, resp.err)
+					continue
+				}
+
+				plaintext := msgPlaintext
+				if (jid.User == ownJID.User || jid.User == ownLID.User) && dsmPlaintext != nil {
+					plaintext = dsmPlaintext
+				}
+
+				limitChan <- struct{}{}
+				wg.Add(1)
+				go func() {
+					defer func() {
+						<-limitChan
+						wg.Done()
+					}()
+					encrypted, isPreKey, err := cli.encryptMessageForDeviceAndWrap(
+						plaintext, jid, retryEncryptionIdentities[i], resp.bundle, encAttrs,
+					)
+					if err != nil {
+						cli.Log.Warnf("Failed to encrypt %s for %s (retry): %v", id, jid, err)
+						return
+					}
+					if isPreKey {
+						includeIdentity.Store(true)
+					}
+					encryptedChan <- encrypted
+				}()
+			}
+		}
+
+		wg.Wait()
+		close(encryptedChan)
+		close(limitChan)
+		receiverWg.Wait()
+	}
+	return participantNodes, includeIdentity.Load()
 }
 
 func (cli *Client) encryptMessageForDevices(

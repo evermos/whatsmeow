@@ -94,13 +94,8 @@ func (cli *Client) DownloadMediaWithPathToFile(
 		// TODO omit hash for unencrypted media?
 		mediaURL := fmt.Sprintf("https://%s%s&hash=%s&mms-type=%s&__wa-mms=", host.Hostname, directPath, base64.URLEncoding.EncodeToString(encFileHash), mmsType)
 		err = cli.downloadAndDecryptToFile(ctx, mediaURL, mediaKey, mediaType, fileLength, encFileHash, fileHash, file)
-		if err == nil ||
-			errors.Is(err, ErrFileLengthMismatch) ||
-			errors.Is(err, ErrInvalidMediaSHA256) ||
-			errors.Is(err, ErrMediaDownloadFailedWith403) ||
-			errors.Is(err, ErrMediaDownloadFailedWith404) ||
-			errors.Is(err, ErrMediaDownloadFailedWith410) ||
-			errors.Is(err, context.Canceled) {
+		if err == nil || errors.Is(err, ErrFileLengthMismatch) || errors.Is(err, ErrInvalidMediaSHA256) ||
+			errors.Is(err, ErrMediaDownloadFailedWith403) || errors.Is(err, ErrMediaDownloadFailedWith404) || errors.Is(err, ErrMediaDownloadFailedWith410) {
 			return err
 		} else if i >= len(mediaConn.Hosts)-1 {
 			return fmt.Errorf("failed to download media from last host: %w", err)
@@ -132,18 +127,16 @@ func (cli *Client) downloadAndDecryptToFile(
 		return fmt.Errorf("failed to seek to start of file after validating mac: %w", err)
 	} else if err = cbcutil.DecryptFile(cipherKey, iv, file); err != nil {
 		return fmt.Errorf("failed to decrypt file: %w", err)
-	} else if ReturnDownloadWarnings {
-		if info, err := file.Stat(); err != nil {
-			return fmt.Errorf("failed to stat file: %w", err)
-		} else if fileLength >= 0 && info.Size() != int64(fileLength) {
-			return fmt.Errorf("%w: expected %d, got %d", ErrFileLengthMismatch, fileLength, info.Size())
-		} else if _, err = file.Seek(0, io.SeekStart); err != nil {
-			return fmt.Errorf("failed to seek to start of file after decrypting: %w", err)
-		} else if _, err = io.Copy(hasher, file); err != nil {
-			return fmt.Errorf("failed to hash file: %w", err)
-		} else if !hmac.Equal(fileSHA256, hasher.Sum(nil)) {
-			return ErrInvalidMediaSHA256
-		}
+	} else if info, err := file.Stat(); err != nil {
+		return fmt.Errorf("failed to stat file: %w", err)
+	} else if info.Size() != int64(fileLength) {
+		return fmt.Errorf("%w: expected %d, got %d", ErrFileLengthMismatch, fileLength, info.Size())
+	} else if _, err = file.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to seek to start of file after decrypting: %w", err)
+	} else if _, err = io.Copy(hasher, file); err != nil {
+		return fmt.Errorf("failed to hash file: %w", err)
+	} else if !hmac.Equal(fileSHA256, hasher.Sum(nil)) {
+		return ErrInvalidMediaSHA256
 	}
 	return nil
 }

@@ -58,7 +58,8 @@ func (cli *Client) refreshMediaConn(ctx context.Context, force bool) (*MediaConn
 }
 
 func (cli *Client) queryMediaConn(ctx context.Context) (*MediaConn, error) {
-	resp, err := cli.sendIQ(ctx, infoQuery{
+	resp, err := cli.sendIQ(infoQuery{
+		Context:   ctx,
 		Namespace: "w:m",
 		Type:      "set",
 		To:        types.ServerJID,

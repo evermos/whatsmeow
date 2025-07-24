@@ -25,6 +25,7 @@ func (cli *Client) TryFetchPrivacySettings(ctx context.Context, ignoreCache bool
 	}
 	resp, err := cli.sendIQ(ctx, infoQuery{
 		Namespace: "privacy",
+		Context:   ctx,
 		Type:      iqGet,
 		To:        types.ServerJID,
 		Content:   []waBinary.Node{{Tag: "privacy"}},

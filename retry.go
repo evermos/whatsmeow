@@ -157,7 +157,8 @@ func (cli *Client) handleRetryReceipt(ctx context.Context, receipt *events.Recei
 		signalSKDMessage, err := builder.Create(ctx, senderKeyName)
 		if err != nil {
 			cli.Log.Warnf("Failed to create sender key distribution message to include in retry of %s in %s to %s: %v", messageID, receipt.Chat, receipt.Sender, err)
-		} else if msg.wa != nil {
+		}
+		if msg.wa != nil {
 			msg.wa.SenderKeyDistributionMessage = &waE2E.SenderKeyDistributionMessage{
 				GroupID:                             proto.String(receipt.Chat.String()),
 				AxolotlSenderKeyDistributionMessage: signalSKDMessage.Serialize(),
@@ -251,7 +252,7 @@ func (cli *Client) handleRetryReceipt(ctx context.Context, receipt *events.Recei
 				encryptionIdentity = lidForPN
 			}
 		}
-		encrypted, includeDeviceIdentity, err = cli.encryptMessageForDevice(ctx, plaintext, encryptionIdentity, bundle, encAttrs, nil)
+		encrypted, includeDeviceIdentity, err = cli.encryptMessageForDevice(ctx, plaintext, encryptionIdentity, bundle, encAttrs)
 	} else {
 		encrypted, err = cli.encryptMessageForDeviceV3(ctx, &waMsgTransport.MessageTransport_Payload{
 			ApplicationPayload: &waCommon.SubProtocol{
@@ -295,7 +296,7 @@ func (cli *Client) handleRetryReceipt(ctx context.Context, receipt *events.Recei
 			{Tag: "franking", Content: []waBinary.Node{{Tag: "franking_tag", Content: frankingTag}}},
 		}
 	}
-	err = cli.sendNode(ctx, waBinary.Node{
+	err = cli.sendNode(waBinary.Node{
 		Tag:     "message",
 		Attrs:   attrs,
 		Content: content,
@@ -333,7 +334,7 @@ func (cli *Client) delayedRequestMessageFromPhone(info *types.MessageInfo) {
 		cli.pendingPhoneRerequestsLock.Unlock()
 		return
 	}
-	ctx, cancel := context.WithCancel(cli.BackgroundEventCtx)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cli.pendingPhoneRerequests[info.ID] = cancel
 	cli.pendingPhoneRerequestsLock.Unlock()
@@ -349,10 +350,6 @@ func (cli *Client) delayedRequestMessageFromPhone(info *types.MessageInfo) {
 		cli.Log.Debugf("Cancelled delayed request for message %s from phone", info.ID)
 		return
 	}
-	cli.immediateRequestMessageFromPhone(ctx, info)
-}
-
-func (cli *Client) immediateRequestMessageFromPhone(ctx context.Context, info *types.MessageInfo) {
 	_, err := cli.SendMessage(
 		ctx,
 		cli.getOwnID().ToNonAD(),
@@ -398,19 +395,21 @@ func (cli *Client) sendRetryReceipt(ctx context.Context, node *waBinary.Node, in
 		return
 	}
 	if retryCount == 1 {
-		if cli.SynchronousAck {
-			cli.immediateRequestMessageFromPhone(ctx, info)
-		} else {
-			go cli.delayedRequestMessageFromPhone(info)
-		}
+		go cli.delayedRequestMessageFromPhone(info)
 	}
 
 	var registrationIDBytes [4]byte
 	binary.BigEndian.PutUint32(registrationIDBytes[:], cli.Store.RegistrationID)
-	attrs := buildBaseReceipt(info.ID, node)
-	attrs["type"] = "retry"
-	if info.Type == "peer_msg" && info.IsFromMe {
-		attrs["category"] = "peer"
+	attrs := waBinary.Attrs{
+		"id":   id,
+		"type": "retry",
+		"to":   node.Attrs["from"],
+	}
+	if recipient, ok := node.Attrs["recipient"]; ok {
+		attrs["recipient"] = recipient
+	}
+	if participant, ok := node.Attrs["participant"]; ok {
+		attrs["participant"] = participant
 	}
 	payload := waBinary.Node{
 		Tag:   "receipt",
@@ -444,7 +443,7 @@ func (cli *Client) sendRetryReceipt(ctx context.Context, node *waBinary.Node, in
 			})
 		}
 	}
-	err := cli.sendNode(ctx, payload)
+	err := cli.sendNode(payload)
 	if err != nil {
 		cli.Log.Errorf("Failed to send retry receipt for %s: %v", id, err)
 	}

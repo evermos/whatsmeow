@@ -103,6 +103,7 @@ func (cli *Client) PairPhone(ctx context.Context, phone string, showPushNotifica
 		Namespace: "md",
 		Type:      iqSet,
 		To:        types.ServerJID,
+		Context:   ctx,
 		Content: []waBinary.Node{{
 			Tag: "link_code_companion_reg",
 			Attrs: waBinary.Attrs{
@@ -226,6 +227,7 @@ func (cli *Client) handleCodePairNotification(ctx context.Context, parentNode *w
 		Namespace: "md",
 		Type:      iqSet,
 		To:        types.ServerJID,
+		Context:   ctx,
 		Content: []waBinary.Node{{
 			Tag: "link_code_companion_reg",
 			Attrs: waBinary.Attrs{

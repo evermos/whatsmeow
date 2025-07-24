@@ -10,7 +10,6 @@ import (
 
 	"go.mau.fi/libsignal/groups"
 	"go.mau.fi/libsignal/protocol"
-	"go.mau.fi/util/ptr"
 	"go.mau.fi/util/random"
 	"google.golang.org/protobuf/proto"
 
@@ -113,7 +112,7 @@ func (cli *ClientV2) SendMessageV2(ctx context.Context, to types.JID, message *w
 	}
 
 	isBotMode := isInlineBotMode || to.IsBot()
-	needsMessageSecret := isBotMode
+	needsMessageSecret := isBotMode || cli.client.shouldIncludeReportingToken(message)
 	var extraParams nodeExtraParams
 
 	if needsMessageSecret {
@@ -185,10 +184,6 @@ func (cli *ClientV2) SendMessageV2(ctx context.Context, to types.JID, message *w
 			if cachedData.AddressingMode == types.AddressingModeLID {
 				ownID = cli.client.getOwnLID()
 				extraParams.addressingMode = types.AddressingModeLID
-				if req.Meta == nil {
-					req.Meta = &types.MsgMetaInfo{}
-				}
-				req.Meta.DeprecatedLIDSession = ptr.Ptr(false)
 			} else if cachedData.CommunityAnnouncementGroup && req.Meta != nil {
 				ownID = cli.client.getOwnLID()
 				// Why is this set to PN?
@@ -223,11 +218,6 @@ func (cli *ClientV2) SendMessageV2(ctx context.Context, to types.JID, message *w
 		resp.DebugTimings.GetParticipants = time.Since(start)
 	} else if to.Server == types.HiddenUserServer {
 		ownID = cli.client.getOwnLID()
-		extraParams.addressingMode = types.AddressingModeLID
-		// if req.Meta == nil {
-		// 	req.Meta = &types.MsgMetaInfo{}
-		// }
-		// req.Meta.DeprecatedLIDSession = ptr.Ptr(false)
 	}
 	if req.Meta != nil {
 		extraParams.metaNode = &waBinary.Node{
@@ -269,8 +259,8 @@ func (cli *ClientV2) SendMessageV2(ctx context.Context, to types.JID, message *w
 	var data []byte
 	switch to.Server {
 	case types.GroupServer, types.BroadcastServer:
-		phash, data, err = cli.sendGroupV2(ctx, to, groupParticipants, req.ID, message, &resp.DebugTimings, extraParams)
-	case types.DefaultUserServer, types.BotServer:
+		phash, data, err = cli.sendGroupV2(ctx, ownID, to, groupParticipants, req.ID, message, &resp.DebugTimings, extraParams)
+	case types.DefaultUserServer, types.BotServer, types.HiddenUserServer:
 		if req.Peer {
 			data, err = cli.client.sendPeerMessage(ctx, to, req.ID, message, &resp.DebugTimings)
 		} else {
@@ -332,6 +322,7 @@ func (cli *ClientV2) SendMessageV2(ctx context.Context, to types.JID, message *w
 
 func (cli *ClientV2) sendGroupV2(
 	ctx context.Context,
+	ownID,
 	to types.JID,
 	participants []types.JID,
 	id types.MessageID,
@@ -390,6 +381,9 @@ func (cli *ClientV2) sendGroupV2(
 		skMsg.Attrs["mediatype"] = mediaType
 	}
 	node.Content = append(node.GetChildren(), skMsg)
+	if cli.client.shouldIncludeReportingToken(message) && message.GetMessageContextInfo().GetMessageSecret() != nil {
+		node.Content = append(node.GetChildren(), cli.client.getMessageReportingToken(plaintext, message, ownID, to, id))
+	}
 
 	start = time.Now()
 	data, err := cli.client.sendNodeAndGetData(*node)
@@ -512,7 +506,7 @@ func (cli *ClientV2) encryptMessageForDevicesConcurrent(
 	for _, jid := range allDevices {
 		plaintext := msgPlaintext
 		if (jid.User == ownJID.User || jid.User == ownLID.User) && dsmPlaintext != nil {
-			if jid == ownJID {
+			if jid == ownJID || jid == ownLID {
 				continue
 			}
 			plaintext = dsmPlaintext
@@ -543,6 +537,7 @@ func (cli *ClientV2) encryptMessageForDevicesConcurrent(
 				retryEncryptionIdentityChan <- encryptionIdentity
 				return
 			} else if err != nil {
+				// TODO return these errors if it's a fatal one (like context cancellation or database)
 				cli.client.Log.Warnf("Failed to encrypt %s for %s: %v", id, jid, err)
 				return
 			}
@@ -602,6 +597,7 @@ func (cli *ClientV2) encryptMessageForDevicesConcurrent(
 						ctx, plaintext, jid, retryEncryptionIdentities[i], resp.bundle, encAttrs,
 					)
 					if err != nil {
+						// TODO return these errors if it's a fatal one (like context cancellation or database)
 						cli.client.Log.Warnf("Failed to encrypt %s for %s (retry): %v", id, jid, err)
 						return
 					}

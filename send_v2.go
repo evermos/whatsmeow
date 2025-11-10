@@ -15,7 +15,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
-	"go.mau.fi/whatsmeow/proto/waBotMetadata"
+	"go.mau.fi/whatsmeow/proto/waAICommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -128,7 +128,7 @@ func (cli *ClientV2) SendMessageV2(ctx context.Context, to types.JID, message *w
 
 	if isBotMode {
 		if message.MessageContextInfo.BotMetadata == nil {
-			message.MessageContextInfo.BotMetadata = &waBotMetadata.BotMetadata{
+			message.MessageContextInfo.BotMetadata = &waAICommon.BotMetadata{
 				PersonaID: proto.String("867051314767696$760019659443059"),
 			}
 		}
@@ -162,7 +162,11 @@ func (cli *ClientV2) SendMessageV2(ctx context.Context, to types.JID, message *w
 				return
 			}
 
-			participantNodes, _ := cli.client.encryptMessageForDevices(ctx, []types.JID{req.InlineBotJID}, resp.ID, messagePlaintext, nil, waBinary.Attrs{})
+			participantNodes, _, encryptError := cli.client.encryptMessageForDevices(ctx, []types.JID{req.InlineBotJID}, resp.ID, messagePlaintext, nil, waBinary.Attrs{})
+			if encryptError != nil {
+				err = encryptError
+				return
+			}
 			extraParams.botNode = &waBinary.Node{
 				Tag:     "bot",
 				Attrs:   nil,
@@ -198,7 +202,7 @@ func (cli *ClientV2) SendMessageV2(ctx context.Context, to types.JID, message *w
 		} else {
 			if len(extra) > 0 && len(extra[0].Participants) > 0 {
 				var privacyStatus []types.StatusPrivacy
-				privacyStatus, err = cli.client.GetStatusPrivacy()
+				privacyStatus, err = cli.client.GetStatusPrivacy(ctx)
 				if err != nil {
 					err = fmt.Errorf("failed to get status privacy: %w", err)
 					return
@@ -211,7 +215,7 @@ func (cli *ClientV2) SendMessageV2(ctx context.Context, to types.JID, message *w
 					}
 				}
 
-				groupParticipants, err = cli.SanitizeStatusBroadcastRecipients(extra[0].Participants)
+				groupParticipants, err = cli.SanitizeStatusBroadcastRecipients(ctx, extra[0].Participants)
 			} else {
 				// TODO use context
 				groupParticipants, err = cli.client.getBroadcastListParticipants(ctx, to)
@@ -275,10 +279,10 @@ func (cli *ClientV2) SendMessageV2(ctx context.Context, to types.JID, message *w
 		if req.Peer {
 			data, err = cli.client.sendPeerMessage(ctx, to, req.ID, message, &resp.DebugTimings)
 		} else {
-			data, err = cli.client.sendDM(ctx, ownID, to, req.ID, message, &resp.DebugTimings, extraParams)
+			_, data, err = cli.client.sendDM(ctx, ownID, to, req.ID, message, &resp.DebugTimings, extraParams)
 		}
 	case types.NewsletterServer:
-		data, err = cli.client.sendNewsletter(to, req.ID, message, req.MediaHandle, &resp.DebugTimings)
+		data, err = cli.client.sendNewsletter(ctx, to, req.ID, message, req.MediaHandle, &resp.DebugTimings)
 	default:
 		err = fmt.Errorf("%w %s", ErrUnknownServer, to.Server)
 	}
@@ -308,7 +312,7 @@ func (cli *ClientV2) SendMessageV2(ctx context.Context, to types.JID, message *w
 	resp.DebugTimings.Resp = time.Since(start)
 	if isDisconnectNode(respNode) {
 		start = time.Now()
-		respNode, err = cli.client.retryFrame("message send", req.ID, data, respNode, ctx, 0)
+		respNode, err = cli.client.retryFrame(ctx, "message send", req.ID, data, respNode, 0)
 		resp.DebugTimings.Retry = time.Since(start)
 		if err != nil {
 			return
@@ -393,7 +397,7 @@ func (cli *ClientV2) sendGroupV2(
 	node.Content = append(node.GetChildren(), skMsg)
 
 	start = time.Now()
-	data, err := cli.client.sendNodeAndGetData(*node)
+	data, err := cli.client.sendNodeAndGetData(ctx, *node)
 	timings.Send = time.Since(start)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to send message node: %w", err)
@@ -449,9 +453,12 @@ func (cli *ClientV2) prepareMessageNodeV2(
 			ctx, allDevices, id, plaintext, dsmPlaintext, encAttrs,
 		)
 	} else {
-		participantNodes, includeIdentity = cli.client.encryptMessageForDevices(
+		participantNodes, includeIdentity, err = cli.client.encryptMessageForDevices(
 			ctx, allDevices, id, plaintext, dsmPlaintext, encAttrs,
 		)
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to encrypt message for devices: %w", err)
 	}
 	timings.PeerEncrypt = time.Since(start)
 	participantNode := waBinary.Node{
@@ -537,7 +544,7 @@ func (cli *ClientV2) encryptMessageForDevicesConcurrent(
 				wg.Done()
 			}()
 			encrypted, isPreKey, err := cli.client.encryptMessageForDeviceAndWrap(
-				ctx, plaintext, jid, encryptionIdentity, nil, encAttrs,
+				ctx, plaintext, jid, encryptionIdentity, nil, encAttrs, nil,
 			)
 			if errors.Is(err, ErrNoSession) {
 				retryDeviceChan <- jid
@@ -600,7 +607,7 @@ func (cli *ClientV2) encryptMessageForDevicesConcurrent(
 						wg.Done()
 					}()
 					encrypted, isPreKey, err := cli.client.encryptMessageForDeviceAndWrap(
-						ctx, plaintext, jid, retryEncryptionIdentities[i], resp.bundle, encAttrs,
+						ctx, plaintext, jid, retryEncryptionIdentities[i], resp.bundle, encAttrs, nil,
 					)
 					if err != nil {
 						cli.client.Log.Warnf("Failed to encrypt %s for %s (retry): %v", id, jid, err)
@@ -622,8 +629,8 @@ func (cli *ClientV2) encryptMessageForDevicesConcurrent(
 	return participantNodes, includeIdentity.Load()
 }
 
-func (cli *ClientV2) SanitizeStatusBroadcastRecipients(contacts map[types.JID]types.ContactInfo) ([]types.JID, error) {
-	statusPrivacyOptions, err := cli.client.GetStatusPrivacy()
+func (cli *ClientV2) SanitizeStatusBroadcastRecipients(ctx context.Context, contacts map[types.JID]types.ContactInfo) ([]types.JID, error) {
+	statusPrivacyOptions, err := cli.client.GetStatusPrivacy(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get status privacy: %w", err)
 	}

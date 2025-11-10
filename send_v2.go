@@ -490,9 +490,41 @@ func (cli *ClientV2) encryptMessageForDevicesConcurrent(
 	encryptedChan := make(chan *waBinary.Node)
 	retryDeviceChan := make(chan types.JID)
 	retryEncryptionIdentityChan := make(chan types.JID)
+
+	var pnDevices []types.JID
+	for _, jid := range allDevices {
+		if jid.Server == types.DefaultUserServer {
+			pnDevices = append(pnDevices, jid)
+		}
+	}
+	lidMappings, err := cli.client.Store.LIDs.GetManyLIDsForPNs(ctx, pnDevices)
+	if err != nil {
+		return nil, false
+	}
 	wg := sync.WaitGroup{}
 	receiverWg := sync.WaitGroup{}
+	encryptionIdentities := make(map[types.JID]types.JID, len(allDevices))
+	sessionAddressToJID := make(map[string]types.JID, len(allDevices))
+	sessionAddresses := make([]string, 0, len(allDevices))
+	for _, jid := range allDevices {
+		encryptionIdentity := jid
+		if jid.Server == types.DefaultUserServer {
+			// TODO query LID from server for missing entries
+			if lidForPN, ok := lidMappings[jid]; ok && !lidForPN.IsEmpty() {
+				cli.client.migrateSessionStore(ctx, jid, lidForPN)
+				encryptionIdentity = lidForPN
+			}
+		}
+		encryptionIdentities[jid] = encryptionIdentity
+		addr := encryptionIdentity.SignalAddress().String()
+		sessionAddresses = append(sessionAddresses, addr)
+		sessionAddressToJID[addr] = jid
+	}
 
+	existingSessions, ctx, err := cli.client.Store.WithCachedSessions(ctx, sessionAddresses)
+	if err != nil {
+		return nil, false
+	}
 	receiverWg.Add(1)
 	go func() {
 		defer receiverWg.Done()
@@ -544,7 +576,7 @@ func (cli *ClientV2) encryptMessageForDevicesConcurrent(
 				wg.Done()
 			}()
 			encrypted, isPreKey, err := cli.client.encryptMessageForDeviceAndWrap(
-				ctx, plaintext, jid, encryptionIdentity, nil, encAttrs, nil,
+				ctx, plaintext, jid, encryptionIdentity, nil, encAttrs, existingSessions,
 			)
 			if errors.Is(err, ErrNoSession) {
 				retryDeviceChan <- jid
@@ -607,7 +639,7 @@ func (cli *ClientV2) encryptMessageForDevicesConcurrent(
 						wg.Done()
 					}()
 					encrypted, isPreKey, err := cli.client.encryptMessageForDeviceAndWrap(
-						ctx, plaintext, jid, retryEncryptionIdentities[i], resp.bundle, encAttrs, nil,
+						ctx, plaintext, jid, retryEncryptionIdentities[i], resp.bundle, encAttrs, existingSessions,
 					)
 					if err != nil {
 						cli.client.Log.Warnf("Failed to encrypt %s for %s (retry): %v", id, jid, err)

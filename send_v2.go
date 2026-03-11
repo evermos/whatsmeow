@@ -259,7 +259,7 @@ func (cli *ClientV2) SendMessageV2(ctx context.Context, to types.JID, message *w
 	respChan := cli.client.waitResponse(req.ID)
 	// Peer message retries aren't implemented yet
 	if !req.Peer {
-		cli.client.addRecentMessage(to, req.ID, message, nil)
+		cli.client.addRecentMessage(ctx, to, req.ID, message, nil)
 	}
 
 	if message.GetMessageContextInfo().GetMessageSecret() != nil {

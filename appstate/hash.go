@@ -20,14 +20,15 @@ import (
 )
 
 type Mutation struct {
-	PatchName    string
-	PatchVersion uint64
+	KeyID        []byte
 	Operation    waServerSync.SyncdMutation_SyncdOperation
 	Action       *waSyncAction.SyncActionValue
 	Version      int32
 	Index        []string
 	IndexMAC     []byte
 	ValueMAC     []byte
+	PatchName    string
+	PatchVersion uint64
 }
 
 type HashState struct {

@@ -137,10 +137,13 @@ func (cli *Client) SendFBMessage(
 	resp.DebugTimings.Queue = time.Since(start)
 	defer cli.messageSendLock.Unlock()
 
-	respChan := cli.waitResponse(req.ID)
 	if !req.Peer {
-		cli.addRecentMessage(to, req.ID, nil, messageAppProto)
+		err = cli.addRecentMessage(ctx, to, req.ID, nil, messageAppProto)
+		if err != nil {
+			return
+		}
 	}
+	respChan := cli.waitResponse(req.ID)
 	var phash string
 	var data []byte
 	switch to.Server {
@@ -439,7 +442,7 @@ func (cli *Client) prepareMessageNodeV3(
 	timings *MessageDebugTimings,
 ) (*waBinary.Node, []types.JID, error) {
 	start := time.Now()
-	allDevices, err := cli.GetUserDevicesContext(ctx, participants)
+	allDevices, err := cli.GetUserDevices(ctx, participants)
 	timings.GetDevices = time.Since(start)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to get device list: %w", err)

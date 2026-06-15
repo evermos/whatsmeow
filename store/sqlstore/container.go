@@ -155,18 +155,7 @@ func (c *Container) scanDevice(row dbutil.Scannable) (*store.Device, error) {
 // GetAllDevices finds all the devices in the database.
 func (c *Container) GetAllDevices(ctx context.Context) ([]*store.Device, error) {
 	res, err := c.db.Query(ctx, getAllDevicesQuery)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query sessions: %w", err)
-	}
-	sessions := make([]*store.Device, 0)
-	for res.Next() {
-		sess, scanErr := c.scanDevice(res)
-		if scanErr != nil {
-			return sessions, scanErr
-		}
-		sessions = append(sessions, sess)
-	}
-	return sessions, nil
+	return dbutil.NewRowIterWithError(res, c.scanDevice, err).AsList()
 }
 
 // GetFirstDevice is a convenience method for getting the first device in the store. If there are
@@ -265,17 +254,7 @@ func (c *Container) PutDevice(ctx context.Context, device *store.Device) error {
 
 func (c *Container) initializeDevice(device *store.Device) {
 	innerStore := NewSQLStore(c, *device.ID)
-	device.Identities = innerStore
-	device.Sessions = innerStore
-	device.PreKeys = innerStore
-	device.SenderKeys = innerStore
-	device.AppStateKeys = innerStore
-	device.AppState = innerStore
-	device.Contacts = innerStore
-	device.ChatSettings = innerStore
-	device.MsgSecrets = innerStore
-	device.PrivacyTokens = innerStore
-	device.EventBuffer = innerStore
+	device.SetAllStores(innerStore)
 	device.LIDs = c.LIDMap
 	device.Container = c
 	device.Initialized = true
